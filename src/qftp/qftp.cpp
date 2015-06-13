@@ -39,8 +39,10 @@
 **
 ****************************************************************************/
 
-//#define QFTPPI_DEBUG
-//#define QFTPDTP_DEBUG
+#ifdef DEBUG
+#define QFTPPI_DEBUG
+#define QFTPDTP_DEBUG
+#endif
 
 #include "qftp.h"
 #include "qabstractsocket.h"
@@ -57,6 +59,7 @@
 #include "qhash.h"
 #include "qtcpserver.h"
 #include "qlocale.h"
+#include <QTimer>
 
 QT_BEGIN_NAMESPACE
 
@@ -186,6 +189,7 @@ private slots:
     void delayedCloseFinished();
     void readyRead();
     void error(QAbstractSocket::SocketError);
+    void check_connectToHost_timeout();
 
     void dtpConnectState(int);
 
@@ -221,6 +225,7 @@ private:
     bool waitForDtpToClose;
 
     QByteArray bytesFromSocket;
+    QTimer timer;
 
     friend class QFtpDTP;
 };
@@ -822,6 +827,9 @@ void QFtpPI::connectToHost(const QString &host, quint16 port)
     dtp.setProperty("_q_networksession", property("_q_networksession"));
 #endif
     commandSocket.connectToHost(host, port);
+    // connection timeout
+    connect(&timer, SIGNAL(timeout()), this, SLOT(check_connectToHost_timeout()));
+    timer.start(55000);
 }
 
 /*
@@ -880,6 +888,8 @@ void QFtpPI::hostFound()
 
 void QFtpPI::connected()
 {
+    timer.stop();
+
     state = Begin;
 #if defined(QFTPPI_DEBUG)
 //    qDebug("QFtpPI state: %d [connected()]", state);
@@ -912,6 +922,15 @@ void QFtpPI::error(QAbstractSocket::SocketError e)
         emit error(QFtp::ConnectionRefused,
                     QFtp::tr("Connection refused to host %1").arg(commandSocket.peerName()));
     } else if (e == QTcpSocket::SocketTimeoutError) {
+        emit connectState(QFtp::Unconnected);
+        emit error(QFtp::ConnectionRefused,
+                   QFtp::tr("Connection timed out to host %1").arg(commandSocket.peerName()));
+    }
+}
+
+void QFtpPI::check_connectToHost_timeout()
+{
+    if (!commandSocket.waitForConnected(1)){
         emit connectState(QFtp::Unconnected);
         emit error(QFtp::ConnectionRefused,
                    QFtp::tr("Connection timed out to host %1").arg(commandSocket.peerName()));
@@ -1212,7 +1231,7 @@ bool QFtpPI::startNextCmd()
     qDebug("QFtpPI send: %s", currentCmd.left(currentCmd.length()-2).toLatin1().constData());
 #endif
     state = Waiting;
-    commandSocket.write(currentCmd.toLatin1());
+    commandSocket.write(currentCmd.toLocal8Bit());
     return true;
 }
 
@@ -2311,39 +2330,39 @@ void QFtpPrivate::_q_piError(int errorCode, const QString &text)
     error = QFtp::Error(errorCode);
     switch (q->currentCommand()) {
         case QFtp::ConnectToHost:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Connecting to host failed:\n%1"))
+            errorString = QFtp::tr("Connecting to host failed:\n%1")
                           .arg(text);
             break;
         case QFtp::Login:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Login failed:\n%1"))
+            errorString = QFtp::tr("Login failed:\n%1")
                           .arg(text);
             break;
         case QFtp::List:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Listing directory failed:\n%1"))
+            errorString = QFtp::tr("Listing directory failed:\n%1")
                           .arg(text);
             break;
         case QFtp::Cd:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Changing directory failed:\n%1"))
+            errorString = QFtp::tr("Changing directory failed:\n%1")
                           .arg(text);
             break;
         case QFtp::Get:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Downloading file failed:\n%1"))
+            errorString = QFtp::tr("Downloading file failed:\n%1")
                           .arg(text);
             break;
         case QFtp::Put:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Uploading file failed:\n%1"))
+            errorString = QFtp::tr("Uploading file failed:\n%1")
                           .arg(text);
             break;
         case QFtp::Remove:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Removing file failed:\n%1"))
+            errorString = QFtp::tr("Removing file failed:\n%1")
                           .arg(text);
             break;
         case QFtp::Mkdir:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Creating directory failed:\n%1"))
+            errorString = QFtp::tr("Creating directory failed:\n%1")
                           .arg(text);
             break;
         case QFtp::Rmdir:
-            errorString = QString::fromLatin1(QT_TRANSLATE_NOOP("QFtp", "Removing directory failed:\n%1"))
+            errorString = QFtp::tr("Removing directory failed:\n%1")
                           .arg(text);
             break;
         default:
@@ -2371,7 +2390,7 @@ void QFtpPrivate::_q_piConnectState(int connectState)
     emit q_func()->stateChanged(state);
     if (close_waitForStateChange) {
         close_waitForStateChange = false;
-        _q_piFinished(QLatin1String(QT_TRANSLATE_NOOP("QFtp", "Connection closed")));
+        _q_piFinished(QFtp::tr("Connection closed"));
     }
 }
 
