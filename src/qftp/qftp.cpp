@@ -60,6 +60,8 @@
 #include "qtcpserver.h"
 #include "qlocale.h"
 #include <QTimer>
+#include <QSslSocket>
+#include <QSslConfiguration>
 
 QT_BEGIN_NAMESPACE
 
@@ -115,6 +117,7 @@ signals:
 
 private slots:
     void socketConnected();
+    void socketEncrypted();
     void socketReadyRead();
     void socketError(QAbstractSocket::SocketError);
     void socketConnectionClosed();
@@ -167,6 +170,12 @@ public:
 
     void clearPendingCommands();
     void abort();
+    bool isTls() {return tls;}
+    void setTls(bool _tls) {tls=_tls;}
+    void addCaCertificates(QList<QSslCertificate> certs)
+    {
+        commandSocket.addCaCertificates(certs);
+    }
 
     QString currentCommand() const
         { return currentCmd; }
@@ -181,6 +190,7 @@ signals:
     void finished(const QString&);
     void error(int, const QString&);
     void rawFtpReply(int, const QString&);
+    void encrypted();
 
 private slots:
     void hostFound();
@@ -190,6 +200,7 @@ private slots:
     void readyRead();
     void error(QAbstractSocket::SocketError);
     void check_connectToHost_timeout();
+    void sslErrors ( const QList<QSslError> & errors ) ;
 
     void dtpConnectState(int);
 
@@ -213,7 +224,7 @@ private:
     bool processReply();
     bool startNextCmd();
 
-    QTcpSocket commandSocket;
+    QSslSocket commandSocket;
     QString replyText;
     char replyCode[3];
     State state;
@@ -223,9 +234,11 @@ private:
 
     bool waitForDtpToConnect;
     bool waitForDtpToClose;
+    bool tls;
 
     QByteArray bytesFromSocket;
     QTimer timer;
+    QSslConfiguration ssl_config;
 
     friend class QFtpDTP;
 };
@@ -323,7 +336,12 @@ void QFtpDTP::connectToHost(const QString & host, quint16 port)
         delete socket;
         socket = 0;
     }
-    socket = new QTcpSocket(this);
+    if (pi->isTls()) {
+        socket = new QSslSocket(this);
+    } else {
+        socket = new QTcpSocket(this);
+    }
+
 #ifndef QT_NO_BEARERMANAGEMENT
     //copy network session down to the socket
     socket->setProperty("_q_networksession", property("_q_networksession"));
@@ -335,7 +353,17 @@ void QFtpDTP::connectToHost(const QString & host, quint16 port)
     connect(socket, SIGNAL(disconnected()), SLOT(socketConnectionClosed()));
     connect(socket, SIGNAL(bytesWritten(qint64)), SLOT(socketBytesWritten(qint64)));
 
-    socket->connectToHost(host, port);
+    QSslSocket* ssl_socket = qobject_cast<QSslSocket*>(socket);
+    if (ssl_socket)	// here we need to setup QSslSocket (0 if QTcpSocket)
+    {
+        connect(ssl_socket, SIGNAL(encrypted()), SLOT(socketEncrypted()));
+
+        //TODO: implement TLS session resumption (err 450)                
+        ssl_socket->setSslConfiguration(pi->ssl_config);
+        ssl_socket->connectToHostEncrypted(host, port);
+    } else {
+        socket->connectToHost(host, port);
+    }
 }
 
 int QFtpDTP::setupListener(const QHostAddress &address)
@@ -650,9 +678,18 @@ bool QFtpDTP::parseDir(const QByteArray &buffer, const QString &userName, QUrlIn
 void QFtpDTP::socketConnected()
 {
     bytesDone = 0;
+    QSslSocket* ssl_socket = qobject_cast<QSslSocket*>(socket);
+    if (ssl_socket){ // 0 if socket is QTcpSocket
+        return; // wait for encrypted
+    }
 #if defined(QFTPDTP_DEBUG)
     qDebug("QFtpDTP::connectState(CsConnected)");
 #endif
+    emit connectState(QFtpDTP::CsConnected);
+}
+
+void QFtpDTP::socketEncrypted()
+{
     emit connectState(QFtpDTP::CsConnected);
 }
 
@@ -795,12 +832,14 @@ QFtpPI::QFtpPI(QObject *parent) :
     QObject(parent),
     rawCommand(false),
     transferConnectionExtended(true),
-    dtp(this),
+    dtp(this, this),
     commandSocket(0),
     state(Begin), abortState(None),
     currentCmd(QString()),
     waitForDtpToConnect(false),
-    waitForDtpToClose(false)
+    waitForDtpToClose(false),
+    tls(false),
+    ssl_config(QSslConfiguration::defaultConfiguration())
 {
     commandSocket.setObjectName(QLatin1String("QFtpPI_socket"));
     connect(&commandSocket, SIGNAL(hostFound()),
@@ -816,6 +855,27 @@ QFtpPI::QFtpPI(QObject *parent) :
 
     connect(&dtp, SIGNAL(connectState(int)),
              SLOT(dtpConnectState(int)));
+
+    connect(&commandSocket, SIGNAL(encrypted()),
+                SIGNAL(encrypted()));
+    connect(&commandSocket, SIGNAL(sslErrors ( const QList<QSslError> & ) ),
+                SLOT(sslErrors ( const QList<QSslError> & ) ));
+
+    // additional ssl settings
+    ssl_config.setProtocol(QSsl::TlsV1_2);
+    ssl_config.setPeerVerifyMode(QSslSocket::VerifyPeer); //TODO: option to disable verification
+    commandSocket.setSslConfiguration(ssl_config);
+}
+
+void QFtpPI::sslErrors ( const QList<QSslError> & errors )
+{
+    QString e;
+    for(int i=0; i< errors.size(); ++i)
+    {
+        e.append((errors[i].errorString())+"\n");
+    }
+
+    emit error((int)QFtp::SslError, e);
 }
 
 void QFtpPI::connectToHost(const QString &host, quint16 port)
@@ -1088,6 +1148,13 @@ bool QFtpPI::processReply()
             QString host = lst[1] + QLatin1Char('.') + lst[2] + QLatin1Char('.') + lst[3] + QLatin1Char('.') + lst[4];
             quint16 port = (lst[5].toUInt() << 8) + lst[6].toUInt();
             waitForDtpToConnect = true;
+            //ssl_conf = commandSocket.sslConfiguration();
+            //dtp.setSsl_config(ssl_conf);
+            //dtp.setSessionTicket(ssl_conf.sessionTicket());
+#ifndef QT_NO_BEARERMANAGEMENT
+    //copy network session down to the socket
+            dtp.setProperty("_q_networksession", commandSocket.property("_q_networksession"));
+#endif
             dtp.connectToHost(host, port);
         }
     } else if (replyCodeInt == 229) {
@@ -1121,8 +1188,16 @@ bool QFtpPI::processReply()
         if (currentCmd.startsWith(QLatin1String("SIZE ")))
             dtp.setBytesTotal(replyText.simplified().toLongLong());
     } else if (replyCode[0]==1 && currentCmd.startsWith(QLatin1String("STOR "))) {
-        dtp.waitForConnection();
+        if (!tls) dtp.waitForConnection();
         dtp.writeData();
+    } else if (replyCodeInt == 234 && tls) //TLS OK
+    {
+        commandSocket.startClientEncryption();
+        commandSocket.waitForEncrypted(); //TODO: check for encrypted or remove wait
+    }
+    else if (replyCodeInt == 235 && tls) //TLS security data needed
+    {
+        state = Failure;
     }
 
     // react on new state
@@ -1195,7 +1270,10 @@ bool QFtpPI::startNextCmd()
     // the address/port arguments are edited in.
     QHostAddress address = commandSocket.localAddress();
     if (currentCmd.startsWith(QLatin1String("PORT"))) {
-        if ((address.protocol() == QTcpSocket::IPv6Protocol) && transferConnectionExtended) {
+        if (tls) {
+            qDebug() << "PORT command ignored in tls mode"; //TODO
+            return false;
+        } else if ((address.protocol() == QTcpSocket::IPv6Protocol) || transferConnectionExtended) {
             int port = dtp.setupListener(address);
             currentCmd = QLatin1String("EPRT |");
             currentCmd += (address.protocol() == QTcpSocket::IPv4Protocol) ? QLatin1Char('1') : QLatin1Char('2');
@@ -1222,7 +1300,7 @@ bool QFtpPI::startNextCmd()
 
         currentCmd += QLatin1String("\r\n");
     } else if (currentCmd.startsWith(QLatin1String("PASV"))) {
-        if ((address.protocol() == QTcpSocket::IPv6Protocol) && transferConnectionExtended)
+        if ((address.protocol() == QTcpSocket::IPv6Protocol) || transferConnectionExtended)
             currentCmd = QLatin1String("EPSV\r\n");
     }
 
@@ -1669,6 +1747,16 @@ int QFtp::connectToHost(const QString &host, quint16 port)
     return id;
 }
 
+void QFtp::addCaCertificates(QList<QSslCertificate> certs)
+{
+    d->pi.addCaCertificates(certs);
+}
+
+void QFtp::setTls(bool tls)
+{
+    return d->pi.setTls(tls);
+}
+
 /*!
     Logs in to the FTP server with the username \a user and the
     password \a password.
@@ -1690,8 +1778,21 @@ int QFtp::connectToHost(const QString &host, quint16 port)
 int QFtp::login(const QString &user, const QString &password)
 {
     QStringList cmds;
+
+    if(d->pi.isTls()){
+        cmds << (QLatin1String("AUTH TLS\r\n"));
+    }
+
     cmds << (QLatin1String("USER ") + (user.isNull() ? QLatin1String("anonymous") : user) + QLatin1String("\r\n"));
     cmds << (QLatin1String("PASS ") + (password.isNull() ? QLatin1String("anonymous@") : password) + QLatin1String("\r\n"));
+
+    //Switch to TLS on the data-channel
+    if(d->pi.isTls())
+    {
+        cmds << (QLatin1String("PBSZ 0\r\n"));
+        cmds << (QLatin1String("PROT P\r\n"));
+    }
+
     return d->addCommand(new QFtpCommand(Login, cmds));
 }
 
@@ -1766,7 +1867,7 @@ int QFtp::list(const QString &dir)
 {
     QStringList cmds;
     cmds << QLatin1String("TYPE A\r\n");
-    cmds << QLatin1String(d->transferMode == Passive ? "PASV\r\n" : "PORT\r\n");
+    cmds << QLatin1String(d->transferMode == Passive ? "EPSV\r\n" : "PORT\r\n");
     if (dir.isEmpty())
         cmds << QLatin1String("LIST\r\n");
     else
@@ -1841,7 +1942,7 @@ int QFtp::get(const QString &file, QIODevice *dev, TransferType type)
     else
         cmds << QLatin1String("TYPE A\r\n");
     cmds << QLatin1String("SIZE ") + file + QLatin1String("\r\n");
-    cmds << QLatin1String(d->transferMode == Passive ? "PASV\r\n" : "PORT\r\n");
+    cmds << QLatin1String(d->transferMode == Passive ? "EPSV\r\n" : "PORT\r\n");
     cmds << QLatin1String("RETR ") + file + QLatin1String("\r\n");
     return d->addCommand(new QFtpCommand(Get, cmds, dev));
 }
@@ -1877,7 +1978,7 @@ int QFtp::put(const QByteArray &data, const QString &file, TransferType type)
         cmds << QLatin1String("TYPE I\r\n");
     else
         cmds << QLatin1String("TYPE A\r\n");
-    cmds << QLatin1String(d->transferMode == Passive ? "PASV\r\n" : "PORT\r\n");
+    cmds << QLatin1String(d->transferMode == Passive ? "EPSV\r\n" : "PORT\r\n");
     cmds << QLatin1String("ALLO ") + QString::number(data.size()) + QLatin1String("\r\n");
     cmds << QLatin1String("STOR ") + file + QLatin1String("\r\n");
     return d->addCommand(new QFtpCommand(Put, cmds, data));
@@ -1904,7 +2005,7 @@ int QFtp::put(QIODevice *dev, const QString &file, TransferType type)
         cmds << QLatin1String("TYPE I\r\n");
     else
         cmds << QLatin1String("TYPE A\r\n");
-    cmds << QLatin1String(d->transferMode == Passive ? "PASV\r\n" : "PORT\r\n");
+    cmds << QLatin1String(d->transferMode == Passive ? "EPSV\r\n" : "PORT\r\n");
     if (!dev->isSequential())
         cmds << QLatin1String("ALLO ") + QString::number(dev->size()) + QLatin1String("\r\n");
     cmds << QLatin1String("STOR ") + file + QLatin1String("\r\n");
