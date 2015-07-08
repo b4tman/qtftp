@@ -120,6 +120,7 @@ private slots:
     void socketEncrypted();
     void socketReadyRead();
     void socketError(QAbstractSocket::SocketError);
+    void sslErrors (const QList<QSslError> &) ;
     void socketConnectionClosed();
     void socketBytesWritten(qint64);
     void setupSocket();
@@ -176,6 +177,10 @@ public:
     {
         commandSocket.addCaCertificates(certs);
     }
+    void ignoreSslErrors(const bool ignore)
+    {
+        _ignoreSslErrors = ignore;
+    }
 
     QString currentCommand() const
         { return currentCmd; }
@@ -196,6 +201,7 @@ private slots:
     void hostFound();
     void connected();
     void connectionClosed();
+    void connectionEncrypted();
     void delayedCloseFinished();
     void readyRead();
     void error(QAbstractSocket::SocketError);
@@ -235,6 +241,7 @@ private:
     bool waitForDtpToConnect;
     bool waitForDtpToClose;
     bool tls;
+    bool _ignoreSslErrors;
 
     QByteArray bytesFromSocket;
     QTimer timer;
@@ -357,6 +364,8 @@ void QFtpDTP::connectToHost(const QString & host, quint16 port)
     if (ssl_socket)	// here we need to setup QSslSocket (0 if QTcpSocket)
     {
         connect(ssl_socket, SIGNAL(encrypted()), SLOT(socketEncrypted()));
+        connect(ssl_socket, SIGNAL(sslErrors ( const QList<QSslError> & ) ),
+                    SLOT(sslErrors ( const QList<QSslError> & ) ));
 
         //TODO: implement TLS session resumption (err 450)                
         ssl_socket->setSslConfiguration(pi->ssl_config);
@@ -780,6 +789,19 @@ void QFtpDTP::socketError(QAbstractSocket::SocketError e)
     }
 }
 
+void QFtpDTP::sslErrors(const QList<QSslError> &)
+{
+    if (pi->_ignoreSslErrors) {
+        QSslSocket *ssl_socket = qobject_cast<QSslSocket*>(socket);
+        if (ssl_socket){
+            ssl_socket->ignoreSslErrors();
+        }
+        return;
+    }
+
+    emit connectState(QFtpDTP::CsConnectionRefused); //TODO: add another connect state
+}
+
 void QFtpDTP::socketConnectionClosed()
 {
     if (!is_ba && data.dev) {
@@ -858,21 +880,28 @@ QFtpPI::QFtpPI(QObject *parent) :
 
     connect(&commandSocket, SIGNAL(encrypted()),
                 SIGNAL(encrypted()));
+    connect(&commandSocket, SIGNAL(encrypted()),
+                SLOT(connectionEncrypted()));
     connect(&commandSocket, SIGNAL(sslErrors ( const QList<QSslError> & ) ),
                 SLOT(sslErrors ( const QList<QSslError> & ) ));
 
     // additional ssl settings
     ssl_config.setProtocol(QSsl::TlsV1_2);
-    ssl_config.setPeerVerifyMode(QSslSocket::VerifyPeer); //TODO: option to disable verification
+    ssl_config.setPeerVerifyMode(QSslSocket::VerifyPeer);
     commandSocket.setSslConfiguration(ssl_config);
 }
 
 void QFtpPI::sslErrors ( const QList<QSslError> & errors )
 {
+    if (_ignoreSslErrors) {
+        commandSocket.ignoreSslErrors();
+        return;
+    }
+
     QString e;
     for(int i=0; i< errors.size(); ++i)
     {
-        e.append((errors[i].errorString())+"\n");
+        e.append((errors[i].errorString())+".\n");
     }
 
     emit error((int)QFtp::SslError, e);
@@ -964,6 +993,12 @@ void QFtpPI::connectionClosed()
 {
     commandSocket.close();
     emit connectState(QFtp::Unconnected);
+}
+
+void QFtpPI::connectionEncrypted()
+{
+    waitForDtpToConnect = false;
+    startNextCmd();
 }
 
 void QFtpPI::delayedCloseFinished()
@@ -1148,9 +1183,6 @@ bool QFtpPI::processReply()
             QString host = lst[1] + QLatin1Char('.') + lst[2] + QLatin1Char('.') + lst[3] + QLatin1Char('.') + lst[4];
             quint16 port = (lst[5].toUInt() << 8) + lst[6].toUInt();
             waitForDtpToConnect = true;
-            //ssl_conf = commandSocket.sslConfiguration();
-            //dtp.setSsl_config(ssl_conf);
-            //dtp.setSessionTicket(ssl_conf.sessionTicket());
 #ifndef QT_NO_BEARERMANAGEMENT
     //copy network session down to the socket
             dtp.setProperty("_q_networksession", commandSocket.property("_q_networksession"));
@@ -1193,7 +1225,7 @@ bool QFtpPI::processReply()
     } else if (replyCodeInt == 234 && tls) //TLS OK
     {
         commandSocket.startClientEncryption();
-        commandSocket.waitForEncrypted(); //TODO: check for encrypted or remove wait
+        waitForDtpToConnect = true; // TODO: use other variable or rename
     }
     else if (replyCodeInt == 235 && tls) //TLS security data needed
     {
@@ -1750,6 +1782,11 @@ int QFtp::connectToHost(const QString &host, quint16 port)
 void QFtp::addCaCertificates(QList<QSslCertificate> certs)
 {
     d->pi.addCaCertificates(certs);
+}
+
+void QFtp::ignoreSslErrors(const bool ignore)
+{
+    d->pi.ignoreSslErrors(ignore);
 }
 
 void QFtp::setTls(bool tls)

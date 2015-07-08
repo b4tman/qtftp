@@ -105,6 +105,7 @@ public:
     int setProxy(const QString &host, quint16 port);
     int connectToHost(const QString &host, quint16 port=21);
     void addCaCertificates(QList<QSslCertificate> certs);
+    void ignoreSslErrors(const bool ignore);
     void setTls(bool tls);
     int login(const QString &user = QString(), const QString &password = QString());
     int close();
